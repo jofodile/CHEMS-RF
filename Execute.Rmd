@@ -1,0 +1,332 @@
+---
+title: "Execute"
+author: "Emily Franklin"
+date: "7/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Automated Property Prediction from Ch3MS-RF
+
+
+
+```{r libraries}
+library(caret)
+library(randomForest)
+library(data.table)
+library(Metrics)
+library(tidyverse)
+library(dplyr)
+```
+## Creating Custom Functions
+```{r}
+#functions for reading in mass spectral libs
+make_file_name <- function(File_Prefix) {
+  file_start <- "Read_Files/Mass_Spectral_Libs/"
+  file_end <- "_MS.csv"
+  full_name <- paste(file_start,File_Prefix,file_end, sep = "")
+  return(full_name)
+}
+
+read_MS_files <- function(fi_name_short) {
+  
+  fi_name <- make_file_name(fi_name_short)
+  temp_bt <<- read_csv(file = fi_name)
+  temp_bt <- temp_bt %>% mutate(File_num = fi_name_short)
+  temp_bt <<- temp_bt
+  var_name <- paste("MS_", fi_name_short, sep = "")
+  assign(var_name, temp_bt, env = .GlobalEnv)
+  return(temp_bt)
+  
+}
+
+make_massive_table <- function(summary_table){
+ 
+  M <- read_MS_files(as.character(summary_table$File_Prefix[1]))
+  for(i in 2:length(summary_table$File_Prefix)){
+    t <- read_MS_files(as.character(summary_table$File_Prefix[i]))
+    Mnew <- rbind(M, t)
+    M <- Mnew
+    print(i)
+  }
+  M_t <<- M
+}
+
+trim.leading <- function (x)  sub("^\\s+", "", x)
+
+left_joinF <- function(x, y, fill = FALSE){
+  z <- left_join(x, y)
+  tmp <- setdiff(names(z), names(x))
+  z <- replace_na(z, setNames(as.list(rep(fill, length(tmp))), tmp))
+  z
+}
+
+left_join0<- function(x, y, fill = 0){
+  z <- left_join(x, y)
+  tmp <- setdiff(names(z), names(x))
+  z <- replace_na(z, setNames(as.list(rep(fill, length(tmp))), tmp))
+  z
+}
+
+#Functions for error evaluation
+rsq <- function (x, y) cor(x, y) ^ 2
+
+OSR2 <- function(predictions, train, test) {
+  SSE <- sum((test - predictions)^2)
+  SST <- sum((test - mean(train))^2)
+  r2 <- 1 - SSE/SST
+  return(r2)
+}
+
+```
+
+
+## Reading In Sample Files, Parsing Mass Spectra
+
+```{r}
+file_index <- read_csv("Read_Files/File_Index.csv")
+
+make_massive_table(file_index)
+M_t <- M_t %>% 
+  filter(d_alkane_RTI > 0) %>% 
+  filter(!is.na(d_alkane_RTI))
+
+
+peak_list.es <- read_csv("Read_Files/ES_peak_list.csv")
+loss_list.es <- read_csv("Read_Files/ES_losses.csv")
+
+  
+  df.t <- M_t %>%  
+    dplyr::mutate(MS = strsplit(as.character(MS), ";")) %>% 
+    unnest(MS) %>% 
+    filter(MS != "") %>% 
+    filter(MS != " \r\n") %>% 
+    filter(MS != " \r\n\r\n") %>% 
+    filter(MS != " \r\n\r\n\r\n") %>% 
+    filter(MS != "") %>%  # getting rid of empty entries
+    dplyr::mutate(MS2 = trim.leading(MS)) 
+    
+  
+  df.t3 = separate(data = df.t, col = MS2, into = c("mz", "intensity"), sep = " ")
+  
+  df.tfull = df.t3 %>% 
+    dplyr::mutate(intensity = as.numeric(intensity)) %>% 
+    dplyr::mutate(mz = as.numeric(mz)) %>% 
+    arrange(desc(intensity)) %>% 
+    arrange(desc(Name)) %>% 
+    group_by(Name) %>%
+    dplyr::mutate(my_ranks = order(order(intensity, decreasing=TRUE))) %>% 
+    ungroup()
+  
+  df.tnames <- M_t%>% 
+    dplyr::select("Name")
+  
+  df.ttrimmed = df.tfull %>% 
+    filter(my_ranks < 11)
+
+  mz_tab.a <- as.data.frame(table(df.ttrimmed$mz))
+
+  mz_tab.a <- mz_tab.a %>% 
+    dplyr::mutate(mz = as.character(Var1)) %>% 
+    dplyr::mutate(mz = as.numeric(mz))
+  
+  mz_tab.a <- mz_tab.a %>% 
+    arrange(desc(Freq)) %>% 
+    dplyr::mutate(freq_ranks = order(order(Freq, decreasing = TRUE)))
+
+  df.tranked <- df.ttrimmed %>% 
+    left_join(mz_tab.a) 
+
+
+# note- here selecting only the MZ of the most common ES list so that the
+#model will be usable
+  df.tcommon_mz = df.tranked %>%
+    dplyr::select(Name, mz, intensity) %>% 
+    dplyr::mutate(mz = paste("mz_", mz, sep = "_")) %>% 
+    dplyr::mutate(mz_obs = TRUE) %>% 
+    dplyr::mutate(mz_intensity = intensity) %>% 
+    left_join(peak_list.es) %>% 
+    filter(istop40 == TRUE) %>% 
+    dplyr::select(-istop40)
+
+wide_mz.a = df.tcommon_mz %>% 
+  dplyr::select(Name, mz, mz_obs) %>% 
+  spread(mz, mz_obs, fill = FALSE) 
+
+wide_mz.a <- df.tnames %>% 
+  left_joinF(wide_mz.a)
+
+
+
+wide_mz_i.a = df.tcommon_mz %>% 
+  dplyr::select(Name, mz, mz_intensity) %>% 
+  spread(mz, mz_intensity, fill = 0) 
+  
+wide_mz_i.a <- df.tnames %>% 
+  left_join0(wide_mz_i.a)
+
+# now parsing losses
+
+unique_names.a = unique(df.ttrimmed$Name)
+
+x = seq(1, 5, 1)
+y = x
+
+d2 <- expand.grid(x = x, y = y, KEEP.OUT.ATTRS = FALSE)
+d2 <- d2 %>% 
+  filter(y > x)
+
+xt = d2$x
+
+yt = d2$y
+
+names_losses.a = as.character(rep(unique_names.a, each = length(d2$x)))
+losses_vec.a = rep(999, times = length(names_losses.a))
+loss_num.a = rep(seq(1, 10, 1), times = length(unique_names.a))
+
+losses.a <- data.frame(names_losses= names_losses.a, losses_vec = losses_vec.a, loss_num = loss_num.a)
+losses.a = losses.a %>% 
+  dplyr::mutate(names_losses = as.character(names_losses))
+
+
+
+for(i in 1:nrow(losses.a)) {
+  #i = 1
+  #i = 8431
+  name_t = losses.a$names_losses[i]
+  loss_num_t = losses.a$loss_num[i]
+  
+  upper_index = xt[loss_num_t]
+  lower_index = yt[loss_num_t]
+  
+  df_t = df.ttrimmed %>% 
+    filter(Name == name_t)
+  
+  upper_mz = df_t$mz[upper_index]
+  lower_mz = df_t$mz[lower_index]
+  
+
+  losses.a$losses_vec[i] = abs(upper_mz - lower_mz)
+  
+}
+
+arranged_mz.a <- df.ttrimmed %>% 
+  arrange(desc(mz)) %>% 
+  arrange(desc(Name)) %>% 
+  dplyr::mutate(loss_fast = 0)
+
+for(i in 2:nrow(arranged_mz.a)){
+  arranged_mz.a$loss_fast[i]= arranged_mz.a$mz[i-1]-arranged_mz.a$mz[i]
+}
+
+arranged_mz.t.a <- as.data.frame(table(arranged_mz.a$loss_fast)) %>% 
+  dplyr::mutate(num_loss = as.character(Var1)) %>% 
+  dplyr::mutate(num_loss = as.numeric(num_loss)) %>% 
+  filter(num_loss > 0) %>% 
+  arrange(desc(Freq)) %>% 
+  dplyr::mutate(id = row_number())
+
+losses.a = losses.a %>%
+  left_join(arranged_mz.t.a, by = c("losses_vec"= "num_loss"))
+
+losses_trimmed.a = losses.a 
+
+df.tcommon_losses = losses_trimmed.a %>%
+  dplyr::select(names_losses, losses_vec) %>% 
+  dplyr::mutate(losses_vec = paste("loss_", losses_vec, sep = "_")) %>% 
+  dplyr::mutate(Loss_obs = TRUE) %>% 
+  distinct() %>% 
+  left_join(loss_list.es) %>% 
+  filter(istop20 == TRUE) %>% 
+  dplyr::select(-istop20)
+
+wide_losses.a = df.tcommon_losses %>% 
+  spread(losses_vec, Loss_obs, fill = FALSE) %>% 
+  right_join(df.tnames, by = c("names_losses"= "Name")) %>% 
+  dplyr::rename(Name = names_losses)
+
+wide_losses.a[is.na(wide_losses.a)] <- FALSE
+
+
+M_mod <- M_t %>% 
+  dplyr::select(Name, d_alkane_RTI) %>% 
+  left_join(wide_mz_i.a) %>% 
+  left_join(wide_losses.a)
+
+```
+## Reading in Amazon properties file
+
+```{r}
+
+AMZ.mod <- read_csv("Read_Files/Modeled_and_real_amz_properties_09142021.csv")
+
+```
+
+## Reading in Ch3MS-RF models
+```{r}
+
+Cnum.mod <- readRDS("Read_Files/Final_Models/Cnum_mod.rds")
+OC.mod <- readRDS("Read_Files/Final_Models/OC_mod.rds")
+OSc.mod <- readRDS("Read_Files/Final_Models/OSc_mod.rds")
+VP.mod <- readRDS("Read_Files/Final_Models/VP_mod.rds")
+
+```
+
+## Predicting Properties
+```{r}
+M_mod.d <- M_mod %>% 
+  dplyr::select(-Name) %>% 
+  dplyr::mutate(tic = 1)
+
+M_prop <- M_mod %>% 
+  dplyr::select(Name, d_alkane_RTI) %>% 
+  left_join(M_t)
+
+Cat.mm = as.data.frame(model.matrix(tic~., data = M_mod.d))
+
+set.seed(144)
+pred.Cnum = predict(Cnum.mod, newdata = Cat.mm, type = "class")
+M_prop$Cnum.p = pred.Cnum
+
+set.seed(144)
+pred.OC = predict(OC.mod, newdata = Cat.mm, type = "class")
+M_prop$OC.p = pred.OC
+
+set.seed(144)
+pred.OSc = predict(OSc.mod, newdata = Cat.mm, type = "class")
+M_prop$OSc.p = pred.OSc
+
+set.seed(144)
+pred.VP = predict(VP.mod, newdata = Cat.mm, type = "class")
+M_prop$VP.p = pred.VP
+
+
+```
+
+# Saving and Plotting the Chamber Data
+
+```{r}
+write.csv(M_prop, "Write_Files/Predicted_Properties.csv")
+
+M_prop %>% 
+  ggplot(aes(x = Cnum.p, y = OSc.p, color = File_num))+
+  geom_point()+
+  scale_x_reverse()+
+  theme_bw()
+
+M_prop %>% 
+  ggplot(aes(x = Cnum.p, y = OSc.p, color = File_num))+
+  geom_point()+
+  facet_grid(rows = vars(File_num))+
+  scale_x_reverse()+
+  theme_bw()
+```
+
+## Special analysis for Amazon manuscript
+```{r}
+
+```
+
